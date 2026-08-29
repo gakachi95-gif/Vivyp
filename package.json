@@ -1,4 +1,4 @@
-hereq{
+{
   "name": "vivy-backend",
   "version": "1.0.0",
   "description": "Small backend for Vivy: verifies Flutterwave payments server-to-server and delivers purchased digital products by email. Deployed separately from the static Vivy site (e.g. on Render).",
