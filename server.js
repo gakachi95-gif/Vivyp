@@ -8,6 +8,8 @@
  *
  * Endpoints:
  *   GET  /                     health check
+ *   GET  /api/free-download/:slug  called by product.html's "Get Free
+ *                               Resource" button — never touches Flutterwave
  *   POST /verify-payment       called by checkout.html right after the
  *                               Flutterwave popup closes
  *   POST /webhook/flutterwave  backup path — Flutterwave calls this on its
@@ -20,7 +22,7 @@ import express from 'express';
 import cors from 'cors';
 import crypto from 'node:crypto';
 
-import { resolveCart, getBySlug } from './lib/products.js';
+import { resolveCart, getBySlug, isFreeProduct } from './lib/products.js';
 import { verifyTransaction, transactionMatchesOrder } from './lib/flutterwave.js';
 import { sendDeliveryEmail } from './lib/email.js';
 
@@ -54,6 +56,33 @@ app.get('/', (req, res) => {
   res.json({ ok: true, service: 'vivy-backend' });
 });
 
+/**
+ * GET /api/free-download/:slug
+ *
+ * The ONLY way a customer ever gets a free download link. Re-checks the
+ * ACTUAL price from our own trusted product data before issuing anything —
+ * a paid product can never come out of this route, no matter what the
+ * client claims.
+ */
+app.get('/api/free-download/:slug', async (req, res) => {
+  try {
+    const product = await getBySlug(req.params.slug);
+    if (!product) {
+      return res.status(404).json({ ok: false, message: 'Product not found.' });
+    }
+    if (!isFreeProduct(product)) {
+      return res.status(403).json({ ok: false, message: 'This product is not free.' });
+    }
+    if (!product.downloadUrl) {
+      return res.status(404).json({ ok: false, message: 'No file is attached to this product yet.' });
+    }
+    return res.json({ ok: true, downloadUrl: product.downloadUrl });
+  } catch (err) {
+    console.error('free-download error:', err);
+    return res.status(500).json({ ok: false, message: 'Could not prepare your download right now.' });
+  }
+});
+
 app.post('/verify-payment', async (req, res) => {
   try {
     const { tx_ref, transaction_id, email, name, items } = req.body || {};
@@ -67,7 +96,15 @@ app.post('/verify-payment', async (req, res) => {
     }
 
     // 1. Work out what this order SHOULD cost, from our own trusted product data.
-    const { items: resolvedItems, total, currency } = await resolveCart(items);
+    let resolvedItems, total, currency;
+    try {
+      ({ items: resolvedItems, total, currency } = await resolveCart(items));
+    } catch (err) {
+      if (err.code === 'FREE_PRODUCT_IN_PAID_CART') {
+        return res.status(400).json({ verified: false, reason: err.message });
+      }
+      throw err;
+    }
     if (!resolvedItems.length) {
       return res.status(400).json({ verified: false, reason: 'No valid products in this order.' });
     }
@@ -148,7 +185,17 @@ app.post('/webhook/flutterwave', express.json(), async (req, res) => {
       return res.status(200).json({ received: true });
     }
 
-    const { items: resolvedItems, total, currency } = await resolveCart(cartItems);
+    let resolvedItems, total, currency;
+    try {
+      ({ items: resolvedItems, total, currency } = await resolveCart(cartItems));
+    } catch (err) {
+      if (err.code === 'FREE_PRODUCT_IN_PAID_CART') {
+        console.warn(`Webhook: transaction ${txId} cart included a free product — skipping delivery.`);
+        processedTransactions.add(String(txId));
+        return res.status(200).json({ received: true });
+      }
+      throw err;
+    }
     if (!resolvedItems.length) {
       processedTransactions.add(String(txId));
       return res.status(200).json({ received: true });
